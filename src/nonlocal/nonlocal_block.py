@@ -1,32 +1,47 @@
 import torch
 import torch.nn as nn
-from .f_functions import gaussian, embedded_gaussian, dot_product, concat_function
-from .g_functions import LinearEmbedding
+import torch.nn.functional as F
 
-class NonLocalBlock(nn.Module):
-    def __init__(self, in_ch, inter_ch=None, f_type="embedded", dim=3):
+class SpacetimeNonLocalBlock(nn.Module):
+    def __init__(self, in_channels, inter_channels=None):
         super().__init__()
-        self.dim = dim
-        inter_ch = inter_ch or in_ch // 2
+        # Bottleneck channels
+        inter_channels = inter_channels or in_channels // 2
 
-        self.g = LinearEmbedding(in_ch, inter_ch)
-        self.Wz = nn.Conv3d(inter_ch, in_ch, kernel_size=1)
-        nn.init.constant_(self.Wz.weight, 0)
+        # g(x) embedding
+        self.g = nn.Conv3d(in_channels, inter_channels, kernel_size=1, bias=False)
 
-        if f_type == "gaussian":
-            self.f = gaussian
-        elif f_type == "embedded":
-            self.f = embedded_gaussian
-        elif f_type == "dot":
-            self.f = dot_product
-        else:
-            raise ValueError(f"{f_type} f-function not implemented")
+        # θ ve φ embedding
+        self.theta = nn.Conv3d(in_channels, inter_channels, kernel_size=1, bias=False)
+        self.phi = nn.Conv3d(in_channels, inter_channels, kernel_size=1, bias=False)
+
+        # Output transform
+        self.Wz = nn.Conv3d(inter_channels, in_channels, kernel_size=1, bias=False)
+        nn.init.constant_(self.Wz.weight, 0) 
 
     def forward(self, x):
-        batch, C, T, H, W = x.shape
-        g_x = self.g(x).view(batch, -1, T*H*W)   
-        x_flat = x.view(batch, C, -1)
-        f_x = self.f(x_flat.transpose(1,2), x_flat.transpose(1,2))
-        f_x = f_x / f_x.sum(-1, keepdim=True)
-        y = torch.matmul(f_x, g_x.transpose(1,2)).transpose(1,2).view(batch, C, T, H, W)
-        return self.Wz(y) + x
+        """
+        x: [B, C, T, H, W]
+        """
+        B, C, T, H, W = x.shape
+
+        # Embedding
+        g_x = self.g(x).view(B, -1, T*H*W)        
+        g_x = g_x.permute(0, 2, 1)               
+
+        theta_x = self.theta(x).view(B, -1, T*H*W)  
+        theta_x = theta_x.permute(0, 2, 1)         
+
+        phi_x = self.phi(x).view(B, -1, T*H*W)      
+
+        # f(θ, φ) = softmax(θ^T φ)
+        f = torch.matmul(theta_x, phi_x)            
+        f_div_C = F.softmax(f, dim=-1)             
+
+        # y = f * g(x)
+        y = torch.matmul(f_div_C, g_x)             
+        y = y.permute(0, 2, 1).contiguous().view(B, -1, T, H, W) 
+
+        # Output + residual
+        z = self.Wz(y) + x
+        return z
